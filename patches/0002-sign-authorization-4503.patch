@@ -1,0 +1,1785 @@
+# Squash patch 2/2
+# Apply after 0001-world-26.3-parity.patch on Pumpkin tag 0.2.2+26.3-26.60.
+#
+# Cherry-pick of Pumpkin #4503 by Gavin Holmes
+# (upstream commit e46b8f93f58eb1af2bb0692ec4c1212393ec2816, 2026-11-09).
+# Local commit on this patch set: f0b953be4b6bd3de77f42c63fc275c6741588ea7.
+#
+# Sign edits need an open editor and a range check.
+# Untrusted sign-click commands are blocked.
+
+diff --git a/crates/pumpkin-core/src/block/blocks/signs.rs b/crates/pumpkin-core/src/block/blocks/signs.rs
+index 1b5f2ac..50a4415 100644
+--- a/crates/pumpkin-core/src/block/blocks/signs.rs
++++ b/crates/pumpkin-core/src/block/blocks/signs.rs
+@@ -1,9 +1,10 @@
+ use std::sync::{Arc, Mutex};
+ 
+ use crate::block::entities::hanging_sign::HangingSignBlockEntity;
+-use crate::block::entities::sign::{SignBlockEntity, SignEntityRef, Text};
++use crate::block::entities::sign::{SIGN_EDIT_RANGE_BUFFER, SignBlockEntity, SignEntityRef, Text};
+ use crate::command::CommandSender;
+ use crate::command::context::command_source::CommandSource;
++use bytes::Bytes;
+ use pumpkin_data::Block;
+ use pumpkin_data::BlockDirection;
+ use pumpkin_data::BlockId;
+@@ -11,14 +12,21 @@ use pumpkin_data::BlockStateId;
+ use pumpkin_data::HorizontalFacingExt;
+ use pumpkin_data::fluid::Fluid;
+ use pumpkin_data::tag::Taggable;
++use pumpkin_data::translation;
+ use pumpkin_inventory::screen_handler::InventoryPlayer;
+ use pumpkin_macros::pumpkin_block_from_tag;
++use pumpkin_nbt::serializer::{NbtWriteHelper, NbtWriteHelperJava};
++use pumpkin_nbt::tag::NbtTag;
++use pumpkin_protocol::IdOr;
++use pumpkin_protocol::java::client::dialog::DialogNBT;
+ use pumpkin_util::math::position::BlockPos;
+ use pumpkin_util::math::vector2::Vector2;
+ use pumpkin_util::math::vector3::Vector3;
+ use pumpkin_util::text::TextComponent;
+-use pumpkin_util::text::click::ClickEvent;
++use pumpkin_util::text::click::{ClickEvent, ClickPayload};
++use pumpkin_util::text::color::NamedColor;
+ use pumpkin_world::tick::TickPriority;
++use tracing::debug;
+ use uuid::Uuid;
+ 
+ use crate::block::BlockBehaviour;
+@@ -38,7 +46,7 @@ use crate::item::items::glowing_ink_sac::GlowingInkSacItem;
+ use crate::item::items::honeycomb::HoneyCombItem;
+ use crate::item::items::ink_sac::InkSacItem;
+ use crate::world::World;
+-use pumpkin_protocol::java::client::play::COpenSignEditor;
++use pumpkin_protocol::java::client::play::{COpenSignEditor, CPlayShowDialog};
+ 
+ #[pumpkin_block_from_tag("minecraft:all_signs")]
+ pub struct SignBlock;
+@@ -559,8 +567,13 @@ impl BlockBehaviour for SignBlock {
+             is_facing_front_text(args.world, args.position, args.block, args.player);
+         let text = sign_entity.get_text(is_front_text);
+ 
+-        let executed_click_command =
+-            execute_click_commands_if_present(args.world, args.player, args.position, text);
++        let executed_click_command = execute_click_commands_if_present(
++            args.world,
++            args.player,
++            args.position,
++            text,
++            sign_entity.allow_op_features(),
++        );
+ 
+         if sign_entity.is_waxed() {
+             let is_hanging = args.block.name.contains("hanging");
+@@ -647,7 +660,13 @@ impl BlockBehaviour for SignBlock {
+             }
+ 
+             if result == BlockActionResult::Success {
+-                execute_click_commands_if_present(args.world, args.player, args.position, text);
++                execute_click_commands_if_present(
++                    args.world,
++                    args.player,
++                    args.position,
++                    text,
++                    sign_entity.allow_op_features(),
++                );
+                 if pumpkin_item.as_any().is::<GlowingInkSacItem>() {
+                     args.player.trigger_advancement(
+                         crate::entity::player::advancement::trigger::AdvancementTrigger::GlowedSign,
+@@ -693,7 +712,7 @@ fn other_player_is_editing_sign(
+     if let Some(editing_player_id) = *currently_editing
+         && editing_player_id != player.gameprofile.id
+         && let Some(editing_player) = world.get_player_by_uuid(editing_player_id)
+-        && editing_player.can_interact_with_block_at(position, 4.0)
++        && editing_player.can_interact_with_block_at(position, SIGN_EDIT_RANGE_BUFFER)
+     {
+         return true;
+     }
+@@ -730,47 +749,118 @@ fn is_plain_or_empty_text(text: &str) -> bool {
+     }
+ }
+ 
+-/// Executes any `run_command` click events defined in the sign's text messages.
++/// Serializes a custom click action payload the same way the client sends it.
++fn click_payload_bytes(payload: &ClickPayload) -> Bytes {
++    let tag = payload.to_nbt();
++    let mut bytes = Vec::new();
++    let mut writer = NbtWriteHelperJava::new(&mut bytes);
++    if writer.write_u8(tag.get_type_id()).is_ok() {
++        let _ = tag.serialize_data(&mut writer);
++    }
++    bytes.into()
++}
++
++/// Shows an inline dialog from a `show_dialog` click event to a Java client.
++fn show_inline_dialog(player: &Arc<Player>, dialog: &ClickPayload) {
++    let NbtTag::Compound(compound) = dialog.to_nbt() else {
++        debug!("Skipping sign show_dialog with a non-inline dialog");
++        return;
++    };
++    if compound.is_empty() {
++        debug!("Skipping sign show_dialog with an empty dialog");
++        return;
++    }
++    let packet = CPlayShowDialog::new(IdOr::Value(DialogNBT::from_nbt(&compound)));
++    player.try_send_client_packet(&packet);
++}
++
++/// Runs a custom click action through the same plugin event used by the client packet.
++fn fire_custom_click_action(
++    server: &Arc<crate::server::Server>,
++    player: &Arc<Player>,
++    id: &str,
++    payload: Option<&ClickPayload>,
++) {
++    let payload = payload.map(click_payload_bytes);
++    let mut event =
++        crate::plugin::api::events::dialog::dialog_click_action::DialogClickActionEvent::new(
++            player.clone(),
++            id.to_string(),
++            payload,
++        );
++    server.plugin_manager.fire_blocking(server, &mut event);
++}
++
++/// Executes any click events defined in the sign's text messages.
+ fn execute_click_commands_if_present(
+     world: &Arc<World>,
+     player: &Arc<Player>,
+     position: &BlockPos,
+     text: &Text,
++    allow_op_features: bool,
+ ) -> bool {
+     let Some(server) = world.server.upgrade() else {
+         return false;
+     };
+ 
+-    let messages = text
+-        .messages
+-        .lock()
+-        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let messages = text.get_messages(player.is_text_filtering_enabled());
++    let mut has_click_command = false;
++    for message in &messages {
++        let Ok(component) = serde_json::from_str::<TextComponent>(message) else {
++            continue;
++        };
++        let Some(click_event) = component.0.style.click_event else {
++            continue;
++        };
++        if !matches!(
++            &click_event,
++            ClickEvent::RunCommand { .. }
++                | ClickEvent::ShowDialog { .. }
++                | ClickEvent::Custom { .. }
++        ) {
++            continue;
++        }
++        has_click_command = true;
+ 
+-    let mut has_run_command = false;
+-    for msg in messages.iter() {
+-        if msg.is_empty() || !msg.starts_with('{') {
++        // Recognizing the action is only used to decide whether the disabled overlay
++        // applies. The action runs only when the sign allows op features.
++        if !allow_op_features {
+             continue;
+         }
+-        if let Ok(component) = serde_json::from_str::<TextComponent>(msg)
+-            && let Some(ClickEvent::RunCommand { command }) = &component.0.style.click_event
+-        {
+-            let source = CommandSource::new(
+-                CommandSender::Dummy,
+-                world.clone(),
+-                Some(player.clone()),
+-                position.to_centered_f64(),
+-                Vector2::new(0.0, 0.0),
+-                player.gameprofile.name.clone(),
+-                player.get_display_name(),
+-                server.clone(),
+-            );
+-            let command_str = command.strip_prefix('/').unwrap_or(command);
+-            let dispatcher = server.command_dispatcher.load();
+-            dispatcher.handle_command(&source, command_str);
+-            has_run_command = true;
++
++        match click_event {
++            ClickEvent::RunCommand { command } => {
++                let source = CommandSource::new(
++                    CommandSender::Dummy,
++                    world.clone(),
++                    Some(player.clone()),
++                    position.to_centered_f64(),
++                    Vector2::new(0.0, 0.0),
++                    player.gameprofile.name.clone(),
++                    player.get_display_name(),
++                    server.clone(),
++                );
++                let command = command.strip_prefix('/').unwrap_or(command.as_ref());
++                let dispatcher = server.command_dispatcher.load();
++                dispatcher.handle_command(&source, command);
++            }
++            ClickEvent::ShowDialog { dialog } => show_inline_dialog(player, &dialog),
++            ClickEvent::Custom { id, payload } => {
++                fire_custom_click_action(&server, player, &id, payload.as_ref());
++            }
++            _ => {}
+         }
+     }
+-    has_run_command
++
++    if !allow_op_features && has_click_command {
++        player.send_system_message_raw(
++            &TextComponent::translate(translation::java::SIGN_CLICK_ACTIONS_DISABLED, [])
++                .color_named(NamedColor::Red),
++            true,
++        );
++    }
++
++    has_click_command
+ }
+ 
+ /// Returns the direction of the block supporting the wall sign.
+diff --git a/crates/pumpkin-core/src/block/entities/hanging_sign.rs b/crates/pumpkin-core/src/block/entities/hanging_sign.rs
+index 7451858..1f370cb 100644
+--- a/crates/pumpkin-core/src/block/entities/hanging_sign.rs
++++ b/crates/pumpkin-core/src/block/entities/hanging_sign.rs
+@@ -13,6 +13,7 @@ pub struct HangingSignBlockEntity {
+     pub front_text: Text,
+     pub back_text: Text,
+     pub is_waxed: AtomicBool,
++    pub allow_op_features: AtomicBool,
+     position: BlockPos,
+     pub currently_editing_player: Arc<Mutex<Option<uuid::Uuid>>>,
+ }
+@@ -30,15 +31,14 @@ impl BlockEntity for HangingSignBlockEntity {
+     where
+         Self: Sized,
+     {
++        let allow_op_features = nbt.get_bool("allow_op_features").unwrap_or(false);
+         let front_text = nbt
+             .get("front_text")
+-            .cloned()
+-            .map(Text::from)
++            .map(|tag| Text::from_nbt_tag(tag, allow_op_features))
+             .unwrap_or_default();
+         let back_text = nbt
+             .get("back_text")
+-            .cloned()
+-            .map(Text::from)
++            .map(|tag| Text::from_nbt_tag(tag, allow_op_features))
+             .unwrap_or_default();
+         let is_waxed = nbt.get_bool("is_waxed").unwrap_or(false);
+         Self {
+@@ -46,6 +46,7 @@ impl BlockEntity for HangingSignBlockEntity {
+             front_text,
+             back_text,
+             is_waxed: AtomicBool::new(is_waxed),
++            allow_op_features: AtomicBool::new(allow_op_features),
+             currently_editing_player: Arc::new(Mutex::new(None)),
+         }
+     }
+@@ -54,6 +55,7 @@ impl BlockEntity for HangingSignBlockEntity {
+         nbt.put("front_text", self.front_text.clone());
+         nbt.put("back_text", self.back_text.clone());
+         nbt.put_bool("is_waxed", self.is_waxed.load(Ordering::Relaxed));
++        crate::block::entities::sign::write_allow_op_features(nbt, &self.allow_op_features);
+     }
+ 
+     fn chunk_data_nbt(&self) -> Option<NbtCompound> {
+@@ -61,6 +63,7 @@ impl BlockEntity for HangingSignBlockEntity {
+         nbt.put("front_text", self.front_text.clone());
+         nbt.put("back_text", self.back_text.clone());
+         nbt.put_bool("is_waxed", self.is_waxed.load(Ordering::Relaxed));
++        crate::block::entities::sign::write_allow_op_features(&mut nbt, &self.allow_op_features);
+         Some(nbt)
+     }
+ 
+@@ -93,6 +96,8 @@ impl BlockEntity for HangingSignBlockEntity {
+             &self.is_waxed,
+             stack,
+         );
++        // Item data must not be able to enable op-level click commands.
++        self.allow_op_features.store(false, Ordering::Relaxed);
+     }
+ 
+     fn as_any(&self) -> &dyn std::any::Any {
+@@ -107,6 +112,7 @@ impl HangingSignBlockEntity {
+         Self {
+             position,
+             is_waxed: AtomicBool::new(false),
++            allow_op_features: AtomicBool::new(false),
+             front_text: if is_front {
+                 Text::from_messages(messages.clone())
+             } else {
+@@ -125,6 +131,7 @@ impl HangingSignBlockEntity {
+         Self {
+             position,
+             is_waxed: AtomicBool::new(false),
++            allow_op_features: AtomicBool::new(false),
+             front_text: Text::default(),
+             back_text: Text::default(),
+             currently_editing_player: Arc::new(Mutex::new(None)),
+diff --git a/crates/pumpkin-core/src/block/entities/sign.rs b/crates/pumpkin-core/src/block/entities/sign.rs
+index 5a1afd6..80a3612 100644
+--- a/crates/pumpkin-core/src/block/entities/sign.rs
++++ b/crates/pumpkin-core/src/block/entities/sign.rs
+@@ -4,6 +4,9 @@ use std::sync::{
+ };
+ 
+ use super::BlockEntity;
++use crate::entity::player::Player;
++use crate::world::World;
++use pumpkin_data::packet::CURRENT_MC_VERSION;
+ use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+ use pumpkin_util::math::position::BlockPos;
+ use pumpkin_util::text::TextComponent;
+@@ -11,10 +14,17 @@ use pumpkin_util::text::click::ClickEvent;
+ 
+ pub use pumpkin_data::dye_color::DyeColor;
+ 
++/// Extra reach allowed when checking that a sign editor is still near the sign.
++///
++/// Added on top of the block interaction range. Vanilla passes the same value to
++/// `Player#isWithinBlockInteractionRange` from `SignBlockEntity#playerIsTooFarAwayToEdit`.
++pub const SIGN_EDIT_RANGE_BUFFER: f64 = 4.0;
++
+ pub struct SignBlockEntity {
+     pub front_text: SignText,
+     pub back_text: SignText,
+     pub is_waxed: AtomicBool,
++    pub allow_op_features: AtomicBool,
+     position: BlockPos,
+     pub currently_editing_player: Arc<Mutex<Option<uuid::Uuid>>>,
+ }
+@@ -50,6 +60,58 @@ impl Default for SignText {
+     }
+ }
+ 
++fn component_to_json(component: &TextComponent) -> Box<str> {
++    Box::from(component.to_json_for_version(&CURRENT_MC_VERSION))
++}
++
++/// Converts a stored NBT message to JSON.
++///
++/// String tags are literal text unless the sign allows op features, where they may be
++/// component JSON written by an older Pumpkin version.
++fn nbt_message_to_json(tag: &NbtTag, allow_op_features: bool) -> Box<str> {
++    match tag {
++        NbtTag::String(value) => {
++            if allow_op_features && let Ok(component) = serde_json::from_str::<TextComponent>(value)
++            {
++                return component_to_json(&component);
++            }
++            component_to_json(&TextComponent::text(value.to_string()))
++        }
++        _ => component_to_json(&TextComponent::from_nbt(tag)),
++    }
++}
++
++/// Converts a stored JSON message to NBT, writing parsed components as compounds.
++///
++/// Writing a simple literal back as a string tag would let an enabled sign promote
++/// saved client text into a component with click actions on the next load.
++fn json_message_to_nbt(message: &str) -> NbtTag {
++    serde_json::from_str::<TextComponent>(message).map_or_else(
++        |_| NbtTag::String(Box::from(message)),
++        |component| NbtTag::Compound(component.to_nbt_compound_for_version(&CURRENT_MC_VERSION)),
++    )
++}
++
++/// Wraps a client-submitted line in a literal component, keeping the original line's style.
++fn literal_message(raw: &str, original: &str) -> Box<str> {
++    let style = serde_json::from_str::<TextComponent>(original)
++        .map(|component| component.0.style)
++        .unwrap_or_default();
++    let mut component = TextComponent::text(raw.to_string());
++    component.0.style = style;
++    component_to_json(&component)
++}
++
++/// Returns whether a stored line has visible component text rather than only structure.
++fn message_has_text(message: &str) -> bool {
++    if message.is_empty() {
++        return false;
++    }
++    serde_json::from_str::<TextComponent>(message).map_or(true, |component| {
++        !component.0.to_bedrock_string().is_empty()
++    })
++}
++
+ #[allow(clippy::fallible_impl_from)]
+ impl From<SignText> for NbtTag {
+     fn from(value: SignText) -> Self {
+@@ -66,7 +128,7 @@ impl From<SignText> for NbtTag {
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         nbt.put_list(
+             "messages",
+-            messages.iter().map(|s| Self::String(s.clone())).collect(),
++            messages.iter().map(|s| json_message_to_nbt(s)).collect(),
+         );
+ 
+         let filtered_messages = value
+@@ -78,7 +140,7 @@ impl From<SignText> for NbtTag {
+                 "filtered_messages",
+                 filtered_messages
+                     .iter()
+-                    .map(|s| Self::String(s.clone()))
++                    .map(|s| json_message_to_nbt(s))
+                     .collect(),
+             );
+         }
+@@ -89,6 +151,13 @@ impl From<SignText> for NbtTag {
+ 
+ impl From<NbtTag> for SignText {
+     fn from(tag: NbtTag) -> Self {
++        Self::from_nbt_tag(&tag, false)
++    }
++}
++
++impl SignText {
++    /// Converts a sign text compound, preserving legacy component strings only for trusted signs.
++    pub fn from_nbt_tag(tag: &NbtTag, allow_op_features: bool) -> Self {
+         let Some(nbt) = tag.extract_compound() else {
+             return Self::default();
+         };
+@@ -96,7 +165,7 @@ impl From<NbtTag> for SignText {
+         let color = nbt.get_string("color").unwrap_or("black");
+         let messages: Vec<Box<str>> = nbt.get_list("messages").map_or_else(Vec::new, |list| {
+             list.iter()
+-                .filter_map(|tag| tag.extract_string().map(Box::from))
++                .map(|tag| nbt_message_to_json(tag, allow_op_features))
+                 .collect()
+         });
+         let get_message =
+@@ -112,7 +181,7 @@ impl From<NbtTag> for SignText {
+         let filtered_messages: Option<Vec<Box<str>>> =
+             nbt.get_list("filtered_messages").map(|list| {
+                 list.iter()
+-                    .filter_map(|tag| tag.extract_string().map(Box::from))
++                    .map(|tag| nbt_message_to_json(tag, allow_op_features))
+                     .collect()
+             });
+ 
+@@ -230,10 +299,11 @@ impl SignText {
+             .clone()
+     }
+ 
++    /// Returns whether any line has visible text content.
+     #[must_use]
+     pub fn has_message(&self, should_filter: bool) -> bool {
+         let messages = self.get_messages(should_filter);
+-        messages.iter().any(|msg| !msg.is_empty())
++        messages.iter().any(|msg| message_has_text(msg))
+     }
+ 
+     #[must_use]
+@@ -251,6 +321,27 @@ impl SignText {
+         }
+         false
+     }
++
++    /// Replaces the raw and filtered messages with lines submitted by a client.
++    ///
++    /// Each line is stored as a literal component with the previous line's style,
++    /// matching `SignBlockEntity#updateMessages`. A submitted line must never keep
++    /// the component syntax the client typed, because that could carry a click event.
++    pub fn set_client_messages(&self, messages: &[Box<str>; 4]) {
++        let mut raw = self
++            .messages
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let new_messages = std::array::from_fn(|i| literal_message(&messages[i], &raw[i]));
++        raw.clone_from(&new_messages);
++        drop(raw);
++
++        let mut filtered = self
++            .filtered_messages
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        *filtered = new_messages;
++    }
+ }
+ 
+ impl BlockEntity for SignBlockEntity {
+@@ -266,15 +357,14 @@ impl BlockEntity for SignBlockEntity {
+     where
+         Self: Sized,
+     {
++        let allow_op_features = nbt.get_bool("allow_op_features").unwrap_or(false);
+         let front_text = nbt
+             .get("front_text")
+-            .cloned()
+-            .map(SignText::from)
++            .map(|tag| SignText::from_nbt_tag(tag, allow_op_features))
+             .unwrap_or_default();
+         let back_text = nbt
+             .get("back_text")
+-            .cloned()
+-            .map(SignText::from)
++            .map(|tag| SignText::from_nbt_tag(tag, allow_op_features))
+             .unwrap_or_default();
+         let is_waxed = nbt.get_bool("is_waxed").unwrap_or(false);
+         Self {
+@@ -282,6 +372,7 @@ impl BlockEntity for SignBlockEntity {
+             front_text,
+             back_text,
+             is_waxed: AtomicBool::new(is_waxed),
++            allow_op_features: AtomicBool::new(allow_op_features),
+             currently_editing_player: Arc::new(Mutex::new(None)),
+         }
+     }
+@@ -290,6 +381,7 @@ impl BlockEntity for SignBlockEntity {
+         nbt.put("front_text", self.front_text.clone());
+         nbt.put("back_text", self.back_text.clone());
+         nbt.put_bool("is_waxed", self.is_waxed.load(Ordering::Relaxed));
++        write_allow_op_features(nbt, &self.allow_op_features);
+     }
+ 
+     fn chunk_data_nbt(&self) -> Option<NbtCompound> {
+@@ -297,6 +389,7 @@ impl BlockEntity for SignBlockEntity {
+         nbt.put("front_text", self.front_text.clone());
+         nbt.put("back_text", self.back_text.clone());
+         nbt.put_bool("is_waxed", self.is_waxed.load(Ordering::Relaxed));
++        write_allow_op_features(&mut nbt, &self.allow_op_features);
+         Some(nbt)
+     }
+ 
+@@ -319,6 +412,8 @@ impl BlockEntity for SignBlockEntity {
+ 
+     fn apply_item_components(&self, stack: &pumpkin_data::item_stack::ItemStack) {
+         apply_sign_item_components(&self.front_text, &self.back_text, &self.is_waxed, stack);
++        // Item data must not be able to enable op-level click commands.
++        self.allow_op_features.store(false, Ordering::Relaxed);
+     }
+ 
+     fn as_any(&self) -> &dyn std::any::Any {
+@@ -406,6 +501,7 @@ impl SignBlockEntity {
+         Self {
+             position,
+             is_waxed: AtomicBool::new(false),
++            allow_op_features: AtomicBool::new(false),
+             front_text: if is_front {
+                 SignText::from_messages(messages.clone())
+             } else {
+@@ -425,6 +521,7 @@ impl SignBlockEntity {
+         Self {
+             position,
+             is_waxed: AtomicBool::new(false),
++            allow_op_features: AtomicBool::new(false),
+             front_text: SignText::default(),
+             back_text: SignText::default(),
+             currently_editing_player: Arc::new(Mutex::new(None)),
+@@ -498,6 +595,62 @@ impl<'a> SignEntityRef<'a> {
+             Self::Hanging(s) => &s.currently_editing_player,
+         }
+     }
++
++    /// Returns whether this sign is allowed to run op-level click commands.
++    #[must_use]
++    pub fn allow_op_features(&self) -> bool {
++        match self {
++            Self::Sign(s) => s.allow_op_features.load(Ordering::Relaxed),
++            Self::Hanging(s) => s.allow_op_features.load(Ordering::Relaxed),
++        }
++    }
++
++    /// Returns the sign's block position.
++    #[must_use]
++    pub fn block_pos(&self) -> BlockPos {
++        match self {
++            Self::Sign(s) => s.get_position(),
++            Self::Hanging(s) => s.get_position(),
++        }
++    }
++
++    /// Mirrors the gate in `SignBlockEntity#updateSignText`: only the player the editor was
++    /// opened for may write text, and only while they can still reach the sign. Vanilla keeps
++    /// that registration from going stale in `SignBlockEntity#tick`; Pumpkin has no sign
++    /// ticker, so `SignBlockEntity#playerIsTooFarAwayToEdit` is checked here instead.
++    #[must_use]
++    pub fn may_update_text(&self, world: &World, player: &Player) -> bool {
++        if self.is_waxed() {
++            return false;
++        }
++
++        let mut editor = self
++            .currently_editing_player()
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if *editor != Some(player.gameprofile.id) {
++            return false;
++        }
++
++        let pos = self.block_pos();
++        if !world.level.is_chunk_loaded(&pos.chunk_position()) {
++            return false;
++        }
++        if !player.can_interact_with_block_at(&pos, SIGN_EDIT_RANGE_BUFFER) {
++            // Vanilla clears this from `SignBlockEntity#tick`; without a sign ticker,
++            // clear it when the registered editor is out of range.
++            *editor = None;
++            return false;
++        }
++        true
++    }
++}
++
++/// Writes the sign's operator-feature flag, matching vanilla's write-only-when-true NBT.
++pub(crate) fn write_allow_op_features(nbt: &mut NbtCompound, allow_op_features: &AtomicBool) {
++    if allow_op_features.load(Ordering::Relaxed) {
++        nbt.put_bool("allow_op_features", true);
++    }
+ }
+ 
+ /// Converts a [`DyeColor`] into the signed 32-bit ARGB integer used by Bedrock signs.
+@@ -551,7 +704,16 @@ pub const fn bedrock_sign_text_color_to_dye_color(color: i32) -> DyeColor {
+ pub fn build_sign_text_compound(sign_text: &SignText) -> NbtCompound {
+     let mut compound = NbtCompound::new();
+     let messages = sign_text.get_messages(false);
+-    let text = messages.join("\n");
++    let text = messages
++        .iter()
++        .map(|message| {
++            serde_json::from_str::<TextComponent>(message).map_or_else(
++                |_| message.to_string(),
++                |component| component.0.to_bedrock_string(),
++            )
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
+     compound.put_string("Text", text);
+     compound.put_int(
+         "SignTextColor",
+@@ -640,4 +802,219 @@ mod tests {
+         assert_eq!(nbt.get_string("id"), Some("HangingSign"));
+         assert_eq!(nbt.get_bool("IsWaxed"), Some(true));
+     }
++
++    #[test]
++    fn allow_op_features_round_trips_through_nbt() {
++        let pos = BlockPos::new(1, 64, 2);
++        let sign = SignBlockEntity::empty(pos);
++
++        let mut nbt = NbtCompound::new();
++        sign.write_nbt(&mut nbt);
++        assert_eq!(nbt.get_bool("allow_op_features"), None);
++
++        sign.allow_op_features.store(true, Ordering::Relaxed);
++        let mut nbt = NbtCompound::new();
++        sign.write_nbt(&mut nbt);
++        assert_eq!(nbt.get_bool("allow_op_features"), Some(true));
++
++        let loaded = SignBlockEntity::from_nbt(&nbt, pos);
++        assert!(loaded.allow_op_features.load(Ordering::Relaxed));
++    }
++
++    fn plain_text(message: &str) -> String {
++        serde_json::from_str::<TextComponent>(message).map_or_else(
++            |_| message.to_string(),
++            |component| component.0.to_bedrock_string(),
++        )
++    }
++
++    #[test]
++    fn literal_client_messages_do_not_carry_click_commands() {
++        let text = SignText::default();
++        let crafted =
++            r#"{"text":"click","click_event":{"action":"run_command","command":"/say hi"}}"#;
++        text.set_client_messages(&[
++            Box::from(crafted),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ]);
++
++        assert!(!text.has_any_click_commands(false));
++        assert_eq!(plain_text(&text.get_message(0, false)), crafted);
++    }
++
++    #[test]
++    fn client_messages_keep_previous_style_and_filtered_text() {
++        use pumpkin_util::text::color::{Color, NamedColor};
++
++        let text = SignText::default();
++        let styled = r#"{"text":"old","color":"red"}"#;
++        *text
++            .messages
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = [
++            Box::from(styled),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ];
++        *text
++            .filtered_messages
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = [
++            Box::from(styled),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ];
++
++        text.set_client_messages(&[
++            Box::from("new"),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ]);
++
++        let messages = text.get_messages(false);
++        assert_eq!(messages, text.get_messages(true));
++        let component = serde_json::from_str::<TextComponent>(&messages[0])
++            .expect("stored client message should be valid JSON");
++        assert_eq!(component.0.style.color, Some(Color::Named(NamedColor::Red)));
++        assert!(component.0.style.click_event.is_none());
++    }
++
++    #[test]
++    fn bedrock_sign_text_keeps_client_lines_literal() {
++        let text = SignText::default();
++        let crafted =
++            r#"{"text":"click","click_event":{"action":"run_command","command":"/say hi"}}"#;
++        text.set_client_messages(&[
++            Box::from(crafted),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ]);
++
++        let nbt = build_sign_text_compound(&text);
++        let expected = format!("{crafted}\n\n\n");
++        assert_eq!(nbt.get_string("Text"), Some(expected.as_str()));
++    }
++
++    #[test]
++    fn component_messages_round_trip_through_nbt() {
++        let crafted =
++            r#"{"text":"click","click_event":{"action":"run_command","command":"/say hi"}}"#;
++        let text = SignText::from_messages([
++            Box::from("hello"),
++            Box::from(crafted),
++            Box::from(""),
++            Box::from(""),
++        ]);
++
++        let loaded = SignText::from(NbtTag::from(text));
++
++        assert_eq!(plain_text(&loaded.get_message(0, false)), "hello");
++        assert!(loaded.has_any_click_commands(false));
++    }
++
++    #[test]
++    fn client_text_stays_literal_after_enabled_sign_reload() {
++        let crafted =
++            r#"{"text":"click","click_event":{"action":"run_command","command":"/say hi"}}"#;
++        let pos = BlockPos::new(1, 64, 2);
++        let sign = SignBlockEntity::empty(pos);
++        sign.allow_op_features.store(true, Ordering::Relaxed);
++        sign.front_text.set_client_messages(&[
++            Box::from(crafted),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ]);
++
++        let mut nbt = NbtCompound::new();
++        sign.write_nbt(&mut nbt);
++        let reloaded = SignBlockEntity::from_nbt(&nbt, pos);
++
++        assert!(!reloaded.front_text.has_any_click_commands(false));
++        assert_eq!(
++            plain_text(&reloaded.front_text.get_message(0, false)),
++            crafted
++        );
++    }
++
++    #[test]
++    fn old_string_messages_load_as_literal_text() {
++        let crafted =
++            r#"{"text":"click","click_event":{"action":"run_command","command":"/say hi"}}"#;
++        let mut nbt = NbtCompound::new();
++        nbt.put_list(
++            "messages",
++            vec![
++                NbtTag::String(Box::from(crafted)),
++                NbtTag::String(Box::from("")),
++                NbtTag::String(Box::from("")),
++                NbtTag::String(Box::from("")),
++            ],
++        );
++
++        let text = SignText::from(NbtTag::Compound(nbt));
++
++        assert!(!text.has_any_click_commands(false));
++        assert_eq!(plain_text(&text.get_message(0, false)), crafted);
++    }
++
++    #[test]
++    fn trusted_legacy_string_components_load_as_components() {
++        let crafted =
++            r#"{"text":"click","click_event":{"action":"run_command","command":"/say hi"}}"#;
++        let mut nbt = NbtCompound::new();
++        nbt.put_bool("allow_op_features", true);
++        let mut front = NbtCompound::new();
++        front.put_list(
++            "messages",
++            vec![
++                NbtTag::String(Box::from(crafted)),
++                NbtTag::String(Box::from("")),
++                NbtTag::String(Box::from("")),
++                NbtTag::String(Box::from("")),
++            ],
++        );
++        nbt.put_compound("front_text", front);
++
++        let trusted = SignBlockEntity::from_nbt(&nbt, BlockPos::new(1, 64, 2));
++        assert!(trusted.front_text.has_any_click_commands(false));
++
++        nbt.put_bool("allow_op_features", false);
++        let untrusted = SignBlockEntity::from_nbt(&nbt, BlockPos::new(1, 64, 2));
++        assert!(!untrusted.front_text.has_any_click_commands(false));
++    }
++
++    #[test]
++    fn empty_literal_messages_are_not_content() {
++        let text = SignText::default();
++        text.set_client_messages(&[Box::from(""), Box::from(""), Box::from(""), Box::from("")]);
++        assert!(!text.has_message(false));
++
++        text.set_client_messages(&[
++            Box::from("visible"),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ]);
++        assert!(text.has_message(false));
++    }
++
++    #[test]
++    fn item_components_do_not_enable_op_features() {
++        let sign = SignBlockEntity::empty(BlockPos::new(1, 64, 2));
++        sign.allow_op_features.store(true, Ordering::Relaxed);
++
++        sign.apply_item_components(&pumpkin_data::item_stack::ItemStack::new(
++            1,
++            &pumpkin_data::item::Item::OAK_SIGN,
++        ));
++
++        assert!(!sign.allow_op_features.load(Ordering::Relaxed));
++    }
+ }
+diff --git a/crates/pumpkin-core/src/entity/player.rs b/crates/pumpkin-core/src/entity/player.rs
+index ce56d66..6411c2b 100644
+--- a/crates/pumpkin-core/src/entity/player.rs
++++ b/crates/pumpkin-core/src/entity/player.rs
+@@ -2854,6 +2854,15 @@ impl Player {
+                 return;
+             }
+         }
++        if let Some(block_entity) = self.world().get_block_entity(&location)
++            && let Some(sign) =
++                crate::block::entities::sign::SignEntityRef::from_block_entity(&*block_entity)
++        {
++            *sign
++                .currently_editing_player()
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.gameprofile.id);
++        }
+         self.try_enqueue_packet_editioned(
+             &COpenSignEditor::new(location, is_front_text),
+             &pumpkin_protocol::bedrock::client::open_sign::COpenSign::new(location, is_front_text),
+diff --git a/crates/pumpkin-core/src/net/bedrock/play/block_actor_data.rs b/crates/pumpkin-core/src/net/bedrock/play/block_actor_data.rs
+index 26a915a..21b73dc 100644
+--- a/crates/pumpkin-core/src/net/bedrock/play/block_actor_data.rs
++++ b/crates/pumpkin-core/src/net/bedrock/play/block_actor_data.rs
+@@ -1,6 +1,7 @@
+ #[allow(clippy::wildcard_imports)]
+ use super::*;
+ use pumpkin_protocol::bedrock::server::block_actor_data::SBlockActorData;
++use tracing::warn;
+ 
+ fn parse_bedrock_sign_lines(text: &str) -> [Box<str>; 4] {
+     let mut lines = [Box::from(""), Box::from(""), Box::from(""), Box::from("")];
+@@ -36,15 +37,7 @@ fn apply_sign_text(
+     }
+ 
+     let sign_text = sign_entity.get_text(is_front);
+-    sign_text
+-        .messages
+-        .lock()
+-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+-        .clone_from(&lines);
+-    *sign_text
+-        .filtered_messages
+-        .lock()
+-        .unwrap_or_else(std::sync::PoisonError::into_inner) = lines;
++    sign_text.set_client_messages(&lines);
+ 
+     if let Some(color_val) = text_comp.get_int("SignTextColor") {
+         let dye = crate::block::entities::sign::bedrock_sign_text_color_to_dye_color(color_val);
+@@ -67,6 +60,8 @@ impl BedrockClient {
+     }
+ 
+     fn handle_sign_block_actor_data(player: &Arc<Player>, packet: &SBlockActorData) {
++        player.update_last_action_time();
++
+         let world = player.get_entity().world.load_full();
+         let Some(block_entity) = world.get_block_entity(&packet.block_position) else {
+             return;
+@@ -76,17 +71,11 @@ impl BedrockClient {
+         else {
+             return;
+         };
+-        if sign_entity.is_waxed() {
+-            return;
+-        }
+-
+-        let currently_editing = *sign_entity
+-            .currently_editing_player()
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+-        if let Some(editor_id) = currently_editing
+-            && editor_id != player.gameprofile.id
+-        {
++        if !sign_entity.may_update_text(&world, player) {
++            warn!(
++                "Player {} just tried to change non-editable sign",
++                player.gameprofile.name
++            );
+             return;
+         }
+ 
+diff --git a/crates/pumpkin-core/src/net/java/play/update_sign.rs b/crates/pumpkin-core/src/net/java/play/update_sign.rs
+index 82c8a4d..ff25f7b 100644
+--- a/crates/pumpkin-core/src/net/java/play/update_sign.rs
++++ b/crates/pumpkin-core/src/net/java/play/update_sign.rs
+@@ -3,7 +3,19 @@ use super::*;
+ 
+ impl JavaClient {
+     pub fn handle_sign_update(&self, player: &Player, sign_data: &SUpdateSign<'_>) {
++        // `ServerGamePacketListenerImpl#updateSignText` resets the action time before validating.
++        player.update_last_action_time();
++
+         let world = player.get_entity().world.load_full();
++        // Vanilla checks the chunk before looking up the block entity. The reusable
++        // `may_update_text` gate repeats this for the Bedrock path, which has no pre-check.
++        if !world
++            .level
++            .is_chunk_loaded(&sign_data.location.chunk_position())
++        {
++            return;
++        }
++
+         let Some(block_entity) = world.get_block_entity(&sign_data.location) else {
+             return;
+         };
+@@ -12,17 +24,11 @@ impl JavaClient {
+         else {
+             return;
+         };
+-        if sign_entity.is_waxed() {
+-            return;
+-        }
+-
+-        let currently_editing = *sign_entity
+-            .currently_editing_player()
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+-        if let Some(editor_id) = currently_editing
+-            && editor_id != player.gameprofile.id
+-        {
++        if !sign_entity.may_update_text(&world, player) {
++            warn!(
++                "Player {} just tried to change non-editable sign",
++                player.gameprofile.name
++            );
+             return;
+         }
+ 
+@@ -56,17 +62,7 @@ impl JavaClient {
+             Box::<str>::from(sign_data.line_4),
+         ];
+ 
+-        text.messages
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+-            .clone_from(&new_messages);
+-        // We do not filter anything, so the filtered copy has to track the raw one. Leaving it
+-        // empty makes it differ, which puts an empty `filtered_messages` on the wire and blanks
+-        // the sign for clients that render with text filtering enabled.
+-        *text
+-            .filtered_messages
+-            .lock()
+-            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_messages;
++        text.set_client_messages(&new_messages);
+         *sign_entity
+             .currently_editing_player()
+             .lock()
+diff --git a/crates/pumpkin-util/src/text/click.rs b/crates/pumpkin-util/src/text/click.rs
+index 0db17f5..bbe890e 100644
+--- a/crates/pumpkin-util/src/text/click.rs
++++ b/crates/pumpkin-util/src/text/click.rs
+@@ -2,6 +2,32 @@ use std::borrow::Cow;
+ 
+ use serde::{Deserialize, Serialize};
+ 
++/// A JSON payload kept verbatim for `show_dialog` and custom click actions.
++///
++/// The value is boxed to keep [`super::style::Style`] small.
++#[derive(Clone, Debug, Serialize, PartialEq, Eq, Hash)]
++#[serde(transparent)]
++pub struct ClickPayload(pub Box<serde_json::Value>);
++
++impl<'de> Deserialize<'de> for ClickPayload {
++    /// NBT has no null payload, so a null cannot round-trip.
++    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let value = serde_json::Value::deserialize(deserializer)?;
++        if value.is_null() {
++            return Err(serde::de::Error::custom("click payload cannot be null"));
++        }
++        Ok(Self(Box::new(value)))
++    }
++}
++
++impl ClickPayload {
++    /// The payload as NBT, as the network writes it.
++    #[must_use]
++    pub fn to_nbt(&self) -> pumpkin_nbt::tag::NbtTag {
++        super::hover::json_to_nbt(&self.0)
++    }
++}
++
+ /// Action to take on click of the text.
+ #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Eq, Hash)]
+ #[serde(tag = "action", rename_all = "snake_case")]
+@@ -12,6 +38,13 @@ pub enum ClickEvent {
+     OpenFile { path: Cow<'static, str> },
+     /// Works in signs but only on the root text component.
+     RunCommand { command: Cow<'static, str> },
++    /// Shows a dialog.
++    ShowDialog { dialog: ClickPayload },
++    /// Runs a custom click action.
++    Custom {
++        id: Cow<'static, str>,
++        payload: Option<ClickPayload>,
++    },
+     /// Replaces the contents of the chat box with the text, not necessarily a
+     /// command.
+     SuggestCommand { command: Cow<'static, str> },
+diff --git a/crates/pumpkin-util/src/text/hover.rs b/crates/pumpkin-util/src/text/hover.rs
+index e01976e..6d87c73 100644
+--- a/crates/pumpkin-util/src/text/hover.rs
++++ b/crates/pumpkin-util/src/text/hover.rs
+@@ -39,7 +39,7 @@ impl ItemComponents {
+ }
+ 
+ /// JSON as NBT: whole numbers as the smallest integer tag that holds them.
+-fn json_to_nbt(value: &serde_json::Value) -> pumpkin_nbt::tag::NbtTag {
++pub(super) fn json_to_nbt(value: &serde_json::Value) -> pumpkin_nbt::tag::NbtTag {
+     use pumpkin_nbt::tag::NbtTag;
+     match value {
+         serde_json::Value::Null => NbtTag::Compound(pumpkin_nbt::compound::NbtCompound::new()),
+diff --git a/crates/pumpkin-util/src/text/mod.rs b/crates/pumpkin-util/src/text/mod.rs
+index b2b6401..77ec954 100644
+--- a/crates/pumpkin-util/src/text/mod.rs
++++ b/crates/pumpkin-util/src/text/mod.rs
+@@ -242,6 +242,17 @@ impl TextComponentBase {
+                         click_tag.put_string("value", command.to_string());
+                     }
+                 }
++                ClickEvent::ShowDialog { dialog } => {
++                    click_tag.put_string("action", "show_dialog".to_string());
++                    click_tag.put("dialog", dialog.to_nbt());
++                }
++                ClickEvent::Custom { id, payload } => {
++                    click_tag.put_string("action", "custom".to_string());
++                    click_tag.put_string("id", id.to_string());
++                    if let Some(payload) = payload {
++                        click_tag.put("payload", payload.to_nbt());
++                    }
++                }
+                 ClickEvent::SuggestCommand { command } => {
+                     click_tag.put_string("action", "suggest_command".to_string());
+                     if *version >= JavaMinecraftVersion::V_1_21_5 {
+@@ -650,6 +661,23 @@ impl TextComponentBase {
+                         );
+                     }
+                 }
++                ClickEvent::ShowDialog { dialog } => {
++                    click_map.insert(
++                        "action".to_string(),
++                        serde_json::Value::String("show_dialog".to_string()),
++                    );
++                    click_map.insert("dialog".to_string(), dialog.0.as_ref().clone());
++                }
++                ClickEvent::Custom { id, payload } => {
++                    click_map.insert(
++                        "action".to_string(),
++                        serde_json::Value::String("custom".to_string()),
++                    );
++                    click_map.insert("id".to_string(), serde_json::Value::String(id.to_string()));
++                    if let Some(payload) = payload {
++                        click_map.insert("payload".to_string(), payload.0.as_ref().clone());
++                    }
++                }
+                 ClickEvent::SuggestCommand { command } => {
+                     click_map.insert(
+                         "action".to_string(),
+@@ -2097,7 +2125,7 @@ pub enum TextContent {
+ /// Tests for the text component implementations.
+ #[cfg(test)]
+ mod test {
+-    use crate::text::click::ClickEvent;
++    use crate::text::click::{ClickEvent, ClickPayload};
+     use crate::text::{
+         TextComponent,
+         color::{Color, NamedColor},
+@@ -2229,6 +2257,42 @@ mod test {
+         assert!(click.get_string("value").is_none());
+     }
+ 
++    #[test]
++    fn sign_click_actions_round_trip_through_json_and_nbt() {
++        let show = TextComponent::text("dialog").click_event(ClickEvent::ShowDialog {
++            dialog: ClickPayload(Box::new(
++                serde_json::json!({"type":"minecraft:notice","title":"x"}),
++            )),
++        });
++        let json = serde_json::to_string(&show).unwrap();
++        let from_json: TextComponent = serde_json::from_str(&json).unwrap();
++        assert_eq!(from_json, show);
++        let nbt = show
++            .0
++            .to_nbt_compound_for_version(&JavaMinecraftVersion::V_26_3);
++        let from_nbt = TextComponent::from_nbt(&pumpkin_nbt::tag::NbtTag::Compound(nbt));
++        assert_eq!(from_nbt, show);
++
++        let custom = TextComponent::text("custom").click_event(ClickEvent::Custom {
++            id: Cow::Borrowed("example:action"),
++            payload: Some(ClickPayload(Box::new(serde_json::json!({"value": 1})))),
++        });
++        let json = serde_json::to_string(&custom).unwrap();
++        let from_json: TextComponent = serde_json::from_str(&json).unwrap();
++        assert_eq!(from_json, custom);
++        let nbt = custom
++            .0
++            .to_nbt_compound_for_version(&JavaMinecraftVersion::V_26_3);
++        let from_nbt = TextComponent::from_nbt(&pumpkin_nbt::tag::NbtTag::Compound(nbt));
++        assert_eq!(from_nbt, custom);
++    }
++
++    #[test]
++    fn null_dialog_payloads_are_rejected() {
++        let json = r#"{"text":"x","click_event":{"action":"show_dialog","dialog":null}}"#;
++        assert!(serde_json::from_str::<TextComponent>(json).is_err());
++    }
++
+     #[test]
+     fn styled_components_parse_from_nbt() {
+         let mut styled = pumpkin_nbt::compound::NbtCompound::new();
+diff --git a/tools/pumpkin-tester/src/bot_tests/mod.rs b/tools/pumpkin-tester/src/bot_tests/mod.rs
+index 5501d64..902b55d 100644
+--- a/tools/pumpkin-tester/src/bot_tests/mod.rs
++++ b/tools/pumpkin-tester/src/bot_tests/mod.rs
+@@ -6,6 +6,7 @@ mod loot_tables;
+ mod player_actions;
+ mod polar_bear;
+ mod sheep_shearing;
++mod sign_authorization;
+ mod status_ping;
+ mod world_interaction;
+ 
+@@ -49,6 +50,8 @@ pub async fn run_bot_tests(
+     player_actions::run_player_actions_and_disconnect_tests(server, bot1, bot2, summary_lines)
+         .await?;
+ 
++    sign_authorization::run_sign_authorization_tests(server, addr, summary_lines).await?;
++
+     embedded_stop::run_embedded_stop_test(summary_lines).await?;
+ 
+     Ok(())
+diff --git a/tools/pumpkin-tester/src/bot_tests/sign_authorization.rs b/tools/pumpkin-tester/src/bot_tests/sign_authorization.rs
+new file mode 100644
+index 0000000..39d379a
+--- /dev/null
++++ b/tools/pumpkin-tester/src/bot_tests/sign_authorization.rs
+@@ -0,0 +1,575 @@
++use std::{
++    sync::{Arc, atomic::Ordering},
++    time::Duration,
++};
++
++use pumpkin_core::{
++    block::entities::{
++        hanging_sign::HangingSignBlockEntity,
++        sign::{DyeColor, SignBlockEntity, SignEntityRef},
++    },
++    entity::EntityBase,
++    server::Server,
++};
++use pumpkin_data::{Block, dimension::Dimension, item::Item, item_stack::ItemStack};
++use pumpkin_protocol::java::server::play::SUpdateSign;
++use pumpkin_util::{
++    GameMode, Hand, PermissionLvl, math::position::BlockPos, math::vector3::Vector3,
++};
++
++use crate::bot::{HeadlessBot, MAX_POLL_TICKS};
++
++const BOT_NAME: &str = "SignAuthBot";
++
++fn stored_line(world: &pumpkin_core::world::World, pos: BlockPos) -> String {
++    world
++        .get_block_entity(&pos)
++        .and_then(|entity| {
++            SignEntityRef::from_block_entity(&*entity)
++                .map(|sign| sign.front_text().get_message(0, false).to_string())
++        })
++        .unwrap_or_default()
++}
++
++fn stored_text(world: &pumpkin_core::world::World, pos: BlockPos) -> String {
++    let raw = stored_line(world, pos);
++    serde_json::from_str::<pumpkin_util::text::TextComponent>(&raw)
++        .map(|component| component.0.to_bedrock_string())
++        .unwrap_or(raw)
++}
++
++fn sign_editor(world: &pumpkin_core::world::World, pos: BlockPos) -> Option<uuid::Uuid> {
++    world.get_block_entity(&pos).and_then(|entity| {
++        SignEntityRef::from_block_entity(&*entity).and_then(|sign| {
++            *sign
++                .currently_editing_player()
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++        })
++    })
++}
++
++fn set_editor(world: &pumpkin_core::world::World, pos: BlockPos, editor: Option<uuid::Uuid>) {
++    if let Some(entity) = world.get_block_entity(&pos)
++        && let Some(sign) = SignEntityRef::from_block_entity(&*entity)
++    {
++        *sign
++            .currently_editing_player()
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = editor;
++    }
++}
++
++fn set_allow_op_features(world: &pumpkin_core::world::World, pos: BlockPos, allow: bool) {
++    if let Some(entity) = world.get_block_entity(&pos)
++        && let Some(SignEntityRef::Sign(sign)) = SignEntityRef::from_block_entity(&*entity)
++    {
++        sign.allow_op_features.store(allow, Ordering::Relaxed);
++    }
++}
++
++fn set_click_component(
++    world: &pumpkin_core::world::World,
++    pos: BlockPos,
++    line: &str,
++    allow_op_features: bool,
++) {
++    if let Some(entity) = world.get_block_entity(&pos)
++        && let Some(SignEntityRef::Sign(sign)) = SignEntityRef::from_block_entity(&*entity)
++    {
++        let messages = [
++            Box::<str>::from(line),
++            Box::from(""),
++            Box::from(""),
++            Box::from(""),
++        ];
++        sign.front_text
++            .messages
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .clone_from(&messages);
++        *sign
++            .front_text
++            .filtered_messages
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = messages;
++        sign.allow_op_features
++            .store(allow_op_features, Ordering::Relaxed);
++        *sign
++            .currently_editing_player
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++    }
++}
++
++async fn tick(server: &Arc<Server>, count: usize) {
++    for _ in 0..count {
++        tokio::time::sleep(Duration::from_millis(5)).await;
++        server.tick();
++    }
++}
++
++fn sign_color(world: &pumpkin_core::world::World, pos: BlockPos) -> Option<DyeColor> {
++    world.get_block_entity(&pos).and_then(|entity| {
++        SignEntityRef::from_block_entity(&*entity).map(|sign| sign.front_text().get_color())
++    })
++}
++
++fn sign_is_glowing(world: &pumpkin_core::world::World, pos: BlockPos) -> bool {
++    world.get_block_entity(&pos).is_some_and(|entity| {
++        SignEntityRef::from_block_entity(&*entity)
++            .is_some_and(|sign| sign.front_text().has_glowing_text())
++    })
++}
++
++fn sign_is_waxed(world: &pumpkin_core::world::World, pos: BlockPos) -> bool {
++    world.get_block_entity(&pos).is_some_and(|entity| {
++        SignEntityRef::from_block_entity(&*entity).is_some_and(|sign| sign.is_waxed())
++    })
++}
++
++fn crafted_click_line(marker: BlockPos) -> String {
++    format!(
++        r#"{{"text":"click","click_event":{{"action":"run_command","command":"/setblock {} {} {} minecraft:emerald_block"}}}}"#,
++        marker.0.x, marker.0.y, marker.0.z
++    )
++}
++
++async fn move_to_and_wait(
++    server: &Arc<Server>,
++    bot: &mut HeadlessBot,
++    player: &pumpkin_core::entity::player::Player,
++    target: Vector3<f64>,
++) -> Result<(), String> {
++    bot.move_to(target, true).await?;
++    for _ in 0..MAX_POLL_TICKS {
++        tick(server, 1).await;
++        let pos = player.get_entity().pos.load();
++        if (pos.x - target.x).abs() < 0.5 && (pos.z - target.z).abs() < 0.5 {
++            return Ok(());
++        }
++    }
++    Err("bot did not reach the requested position".to_string())
++}
++
++async fn place_sign(server: &Arc<Server>, world: &pumpkin_core::world::World, pos: BlockPos) {
++    world
++        .level
++        .set_block_state(&pos.down(), Block::STONE.default_state.id);
++    world
++        .level
++        .set_block_state(&pos, Block::OAK_SIGN.default_state.id);
++    world.add_block_entity(Arc::new(SignBlockEntity::empty(pos)));
++    tick(server, 2).await;
++}
++
++async fn send_update(bot: &mut HeadlessBot, pos: BlockPos, line: &str) -> Result<(), String> {
++    bot.send_packet(&SUpdateSign {
++        location: pos,
++        is_front_text: true,
++        line_1: line,
++        line_2: "",
++        line_3: "",
++        line_4: "",
++    })
++    .await
++}
++
++async fn click_and_wait(
++    server: &Arc<Server>,
++    bot: &mut HeadlessBot,
++    pos: BlockPos,
++    sequence: i32,
++) -> Result<(), String> {
++    bot.use_block(pos, sequence).await?;
++    // The click command runs during the interaction, so a short window is enough.
++    tick(server, 40).await;
++    Ok(())
++}
++
++async fn run_out_of_range_case(
++    server: &Arc<Server>,
++    world: &pumpkin_core::world::World,
++    bot: &mut HeadlessBot,
++    player: &pumpkin_core::entity::player::Player,
++    base: BlockPos,
++) -> Result<(), String> {
++    // The registered editor must still be within edit range.
++    let out_of_range = base.offset(Vector3::new(4, 0, 0));
++    place_sign(server, world, out_of_range).await;
++    let chunk = out_of_range.chunk_position();
++    let inserted = world
++        .forced_chunks
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .insert(chunk);
++    let before = stored_text(world, out_of_range);
++    if !before.is_empty() {
++        return Err(format!("sign was not empty after placement: {before:?}"));
++    }
++    let pos = player.get_entity().pos.load();
++    let far = Vector3::new(pos.x + 100.0, pos.y, pos.z);
++    move_to_and_wait(server, bot, player, far).await?;
++    set_editor(world, out_of_range, Some(player.gameprofile.id));
++    send_update(bot, out_of_range, "OUT_OF_RANGE").await?;
++    tick(server, 20).await;
++    if !stored_text(world, out_of_range).is_empty() {
++        return Err(format!(
++            "SIGN_UPDATE changed a sign from out of edit range (player at {:?}, stored {:?})",
++            player.get_entity().pos.load(),
++            stored_text(world, out_of_range)
++        ));
++    }
++    if sign_editor(world, out_of_range).is_some() {
++        return Err("out-of-range sign editor was not cleared".to_string());
++    }
++    let home = Vector3::new(
++        f64::from(base.0.x) + 0.5,
++        f64::from(base.0.y),
++        f64::from(base.0.z) + 0.5,
++    );
++    move_to_and_wait(server, bot, player, home).await?;
++
++    // Returning to range must not reauthorize the cleared editor.
++    send_update(bot, out_of_range, "RETURNED").await?;
++    tick(server, 20).await;
++    if !stored_text(world, out_of_range).is_empty() {
++        return Err("returning to range re-authorized a cleared sign editor".to_string());
++    }
++
++    if inserted {
++        world
++            .forced_chunks
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .remove(&chunk);
++    }
++
++    Ok(())
++}
++
++async fn run_range_buffer_case(
++    server: &Arc<Server>,
++    world: &pumpkin_core::world::World,
++    bot: &mut HeadlessBot,
++    player: &pumpkin_core::entity::player::Player,
++    base: BlockPos,
++) -> Result<(), String> {
++    // Vanilla's `playerIsTooFarAwayToEdit` allows four more blocks than the
++    // normal interaction range, so an update inside that buffer is still valid.
++    let pos = base.offset(Vector3::new(0, 0, 4));
++    place_sign(server, world, pos).await;
++    let target = Vector3::new(
++        f64::from(pos.0.x) + 6.5,
++        f64::from(pos.0.y),
++        f64::from(pos.0.z) + 0.5,
++    );
++    move_to_and_wait(server, bot, player, target).await?;
++    if player.can_interact_with_block_at(&pos, 0.0) {
++        return Err("range buffer case started inside the base interaction range".to_string());
++    }
++    if !player.can_interact_with_block_at(&pos, 4.0) {
++        return Err("range buffer case started outside the edit buffer".to_string());
++    }
++    set_editor(world, pos, Some(player.gameprofile.id));
++    send_update(bot, pos, "BUFFER").await?;
++    tick(server, 20).await;
++    if stored_text(world, pos) != "BUFFER" {
++        return Err(format!(
++            "SIGN_UPDATE inside the edit buffer was rejected (player at {:?})",
++            player.get_entity().pos.load()
++        ));
++    }
++
++    // Past the four-block buffer must still be rejected.
++    let beyond = 1.0 + player.block_interaction_range() + 4.0 + 1.0;
++    let target = Vector3::new(
++        f64::from(pos.0.x) + beyond,
++        f64::from(pos.0.y),
++        f64::from(pos.0.z) + 0.5,
++    );
++    move_to_and_wait(server, bot, player, target).await?;
++    send_update(bot, pos, "BEYOND").await?;
++    tick(server, 20).await;
++    if stored_text(world, pos) != "BUFFER" {
++        return Err("SIGN_UPDATE past the edit buffer was accepted".to_string());
++    }
++    let home = Vector3::new(
++        f64::from(base.0.x) + 0.5,
++        f64::from(base.0.y),
++        f64::from(base.0.z) + 0.5,
++    );
++    move_to_and_wait(server, bot, player, home).await?;
++
++    Ok(())
++}
++
++async fn run_authorization_cases(
++    server: &Arc<Server>,
++    world: &pumpkin_core::world::World,
++    bot: &mut HeadlessBot,
++    player: &pumpkin_core::entity::player::Player,
++    base: BlockPos,
++) -> Result<(), String> {
++    // A sign nobody has opened must not accept an update.
++    let no_editor = base.offset(Vector3::new(2, 0, 0));
++    place_sign(server, world, no_editor).await;
++    send_update(bot, no_editor, "NO_EDITOR").await?;
++    tick(server, 20).await;
++    if !stored_text(world, no_editor).is_empty() {
++        return Err("SIGN_UPDATE changed a sign with no registered editor".to_string());
++    }
++
++    // A different player registered as editor must not accept an update.
++    let wrong_editor = base.offset(Vector3::new(3, 0, 0));
++    place_sign(server, world, wrong_editor).await;
++    set_editor(world, wrong_editor, Some(uuid::Uuid::new_v4()));
++    send_update(bot, wrong_editor, "WRONG_EDITOR").await?;
++    tick(server, 20).await;
++    if !stored_text(world, wrong_editor).is_empty() {
++        return Err("SIGN_UPDATE changed a sign registered to another player".to_string());
++    }
++
++    run_out_of_range_case(server, world, bot, player, base).await?;
++    run_range_buffer_case(server, world, bot, player, base).await?;
++
++    // A waxed sign must not accept an update even from its registered editor.
++    let waxed = base.offset(Vector3::new(2, 0, 1));
++    place_sign(server, world, waxed).await;
++    set_editor(world, waxed, Some(player.gameprofile.id));
++    if let Some(entity) = world.get_block_entity(&waxed)
++        && let Some(sign) = SignEntityRef::from_block_entity(&*entity)
++    {
++        sign.set_waxed(true);
++    }
++    send_update(bot, waxed, "WAXED").await?;
++    tick(server, 20).await;
++    if !stored_text(world, waxed).is_empty() {
++        return Err("SIGN_UPDATE changed a waxed sign".to_string());
++    }
++
++    // A legitimate editor update still applies.
++    let editable = base.offset(Vector3::new(4, 0, 1));
++    place_sign(server, world, editable).await;
++    set_editor(world, editable, Some(player.gameprofile.id));
++    send_update(bot, editable, "LEGIT").await?;
++    tick(server, 20).await;
++    if stored_text(world, editable) != "LEGIT" {
++        return Err("SIGN_UPDATE from the registered editor in range was rejected".to_string());
++    }
++
++    // Opening through the plugin API registers the player as the editor.
++    let plugin_editor = base.offset(Vector3::new(1, 0, 2));
++    place_sign(server, world, plugin_editor).await;
++    player.open_sign_editor(plugin_editor, true);
++    tick(server, 2).await;
++    send_update(bot, plugin_editor, "PLUGIN").await?;
++    tick(server, 20).await;
++    if stored_text(world, plugin_editor) != "PLUGIN" {
++        return Err("plugin-opened sign editor rejected its update".to_string());
++    }
++
++    // Opening through player interaction registers the editor too.
++    let interacted_editor = base.offset(Vector3::new(3, 0, 2));
++    place_sign(server, world, interacted_editor).await;
++    bot.use_block(interacted_editor, 899).await?;
++    tick(server, 2).await;
++    send_update(bot, interacted_editor, "OPENED").await?;
++    tick(server, 20).await;
++    if stored_text(world, interacted_editor) != "OPENED" {
++        return Err("player-opened sign editor rejected its update".to_string());
++    }
++
++    // Hanging signs use the same gate.
++    let hanging = base.offset(Vector3::new(5, 0, 1));
++    world
++        .level
++        .set_block_state(&hanging.up(), Block::STONE.default_state.id);
++    world
++        .level
++        .set_block_state(&hanging, Block::OAK_HANGING_SIGN.default_state.id);
++    world.add_block_entity(Arc::new(HangingSignBlockEntity::empty(hanging)));
++    tick(server, 2).await;
++    set_editor(world, hanging, Some(player.gameprofile.id));
++    send_update(bot, hanging, "HANGING").await?;
++    tick(server, 20).await;
++    if stored_text(world, hanging) != "HANGING" {
++        return Err("SIGN_UPDATE on a hanging sign was rejected".to_string());
++    }
++
++    Ok(())
++}
++
++async fn run_click_command_cases(
++    server: &Arc<Server>,
++    world: &pumpkin_core::world::World,
++    bot: &mut HeadlessBot,
++    player: &pumpkin_core::entity::player::Player,
++    base: BlockPos,
++) -> Result<(), String> {
++    let marker = base.offset(Vector3::new(0, 5, 0));
++    world
++        .level
++        .set_block_state(&marker, Block::AIR.default_state.id);
++    let crafted = crafted_click_line(marker);
++
++    // A client-submitted line that looks like a component must stay literal.
++    let crafted_pos = base.offset(Vector3::new(5, 0, 0));
++    place_sign(server, world, crafted_pos).await;
++    set_editor(world, crafted_pos, Some(player.gameprofile.id));
++    send_update(bot, crafted_pos, &crafted).await?;
++    tick(server, 20).await;
++
++    click_and_wait(server, bot, crafted_pos, 900).await?;
++    if world.get_block(&marker).id == Block::EMERALD_BLOCK.id {
++        return Err("a normal sign executed a run_command click event".to_string());
++    }
++
++    // A sign that allows op features follows vanilla and does execute.
++    set_click_component(world, crafted_pos, &crafted, true);
++    click_and_wait(server, bot, crafted_pos, 901).await?;
++    if world.get_block(&marker).id != Block::EMERALD_BLOCK.id {
++        return Err("an allow_op_features sign did not execute its click command".to_string());
++    }
++
++    // The same stored component without allow_op_features must not execute.
++    world
++        .level
++        .set_block_state(&marker, Block::AIR.default_state.id);
++    set_click_component(world, crafted_pos, &crafted, false);
++    click_and_wait(server, bot, crafted_pos, 902).await?;
++    if world.get_block(&marker).id == Block::EMERALD_BLOCK.id {
++        return Err("a sign without allow_op_features executed a click command".to_string());
++    }
++    if sign_editor(world, crafted_pos).is_some() {
++        return Err("a disabled sign click opened the editor instead of the overlay".to_string());
++    }
++
++    // Editing a sign that allows op features must not let a client inject a new
++    // click command; the submitted line is still stored literally.
++    place_sign(server, world, crafted_pos).await;
++    set_editor(world, crafted_pos, Some(player.gameprofile.id));
++    send_update(bot, crafted_pos, "trusted").await?;
++    tick(server, 20).await;
++    set_allow_op_features(world, crafted_pos, true);
++    set_editor(world, crafted_pos, Some(player.gameprofile.id));
++    send_update(bot, crafted_pos, &crafted).await?;
++    tick(server, 20).await;
++    if stored_text(world, crafted_pos) != crafted {
++        return Err(
++            "client text on an allow_op_features sign was not stored literally".to_string(),
++        );
++    }
++
++    world
++        .level
++        .set_block_state(&marker, Block::AIR.default_state.id);
++    click_and_wait(server, bot, crafted_pos, 903).await?;
++    if world.get_block(&marker).id == Block::EMERALD_BLOCK.id {
++        return Err("editing an allow_op_features sign injected a click command".to_string());
++    }
++
++    // show_dialog must also take the disabled-click branch.
++    let show_dialog = r#"{"text":"dialog","click_event":{"action":"show_dialog","dialog":{"type":"minecraft:notice","title":"x"}}}"#;
++    set_click_component(world, crafted_pos, show_dialog, false);
++    click_and_wait(server, bot, crafted_pos, 904).await?;
++    if sign_editor(world, crafted_pos).is_some() {
++        return Err("a disabled show_dialog click opened the editor".to_string());
++    }
++
++    Ok(())
++}
++
++async fn run_applicator_cases(
++    server: &Arc<Server>,
++    world: &pumpkin_core::world::World,
++    bot: &mut HeadlessBot,
++    player: &pumpkin_core::entity::player::Player,
++    base: BlockPos,
++) -> Result<(), String> {
++    // Dyeing a sign with a disabled click command must not run it.
++    let marker = base.offset(Vector3::new(0, 5, 0));
++    world
++        .level
++        .set_block_state(&marker, Block::AIR.default_state.id);
++    let crafted = crafted_click_line(marker);
++    let click_apply_pos = base.offset(Vector3::new(3, 0, 1));
++    place_sign(server, world, click_apply_pos).await;
++    set_editor(world, click_apply_pos, Some(player.gameprofile.id));
++    send_update(bot, click_apply_pos, "apply click").await?;
++    tick(server, 20).await;
++    set_click_component(world, click_apply_pos, &crafted, false);
++
++    let inventory = player.inventory();
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::new(1, &Item::RED_DYE));
++    click_and_wait(server, bot, click_apply_pos, 905).await?;
++    if sign_color(world, click_apply_pos) != Some(DyeColor::Red) {
++        return Err("dye did not apply to a sign with a click command".to_string());
++    }
++    if world.get_block(&marker).id == Block::EMERALD_BLOCK.id {
++        return Err("dye application executed a disabled click command".to_string());
++    }
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::EMPTY.clone());
++
++    let pos = base.offset(Vector3::new(1, 0, 1));
++    place_sign(server, world, pos).await;
++    set_editor(world, pos, Some(player.gameprofile.id));
++    send_update(bot, pos, "APPLY").await?;
++    tick(server, 20).await;
++
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::new(1, &Item::RED_DYE));
++    click_and_wait(server, bot, pos, 906).await?;
++    if sign_color(world, pos) != Some(DyeColor::Red) {
++        return Err("dye did not apply to a sign".to_string());
++    }
++
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::new(1, &Item::GLOW_INK_SAC));
++    click_and_wait(server, bot, pos, 907).await?;
++    if !sign_is_glowing(world, pos) {
++        return Err("glow ink sac did not apply to a sign".to_string());
++    }
++
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::new(1, &Item::INK_SAC));
++    click_and_wait(server, bot, pos, 908).await?;
++    if sign_is_glowing(world, pos) {
++        return Err("ink sac did not remove glowing text".to_string());
++    }
++
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::new(1, &Item::HONEYCOMB));
++    click_and_wait(server, bot, pos, 909).await?;
++    if !sign_is_waxed(world, pos) {
++        return Err("honeycomb did not wax a sign".to_string());
++    }
++    inventory.set_stack_in_hand(Hand::Right, ItemStack::EMPTY.clone());
++
++    Ok(())
++}
++
++pub async fn run_sign_authorization_tests(
++    server: &Arc<Server>,
++    addr: std::net::SocketAddr,
++    summary_lines: &mut Vec<String>,
++) -> Result<(), String> {
++    let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
++    let mut bot = HeadlessBot::connect_and_join(addr, BOT_NAME).await?;
++
++    let Some(player) = world.get_player_by_name(BOT_NAME) else {
++        return Err(format!("Could not find '{BOT_NAME}' in Overworld"));
++    };
++    let dispatcher = server.command_dispatcher.load();
++    player.set_permission_lvl(server, PermissionLvl::Zero, &dispatcher);
++    player.set_gamemode(GameMode::Survival);
++
++    let base = BlockPos::new(
++        bot.position.x.floor() as i32,
++        bot.position.y.floor() as i32,
++        bot.position.z.floor() as i32,
++    );
++
++    run_authorization_cases(server, &world, &mut bot, &player, base).await?;
++    run_click_command_cases(server, &world, &mut bot, &player, base).await?;
++    run_applicator_cases(server, &world, &mut bot, &player, base).await?;
++
++    summary_lines.push("[PASS] bot:sign_authorization_click_commands_and_applicators".to_string());
++    Ok(())
++}

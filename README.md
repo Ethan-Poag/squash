@@ -6,7 +6,7 @@ This repo ships a patch set on a pinned Pumpkin release, not a full copy of Pump
 
 Report bugs here. Do not file Squash bugs on the upstream Pumpkin tracker.
 
-These patches were written with AI help and then reviewed and tested by Ethan Poag's setup. Treat this project as AI-assisted.
+I wrote these patches with AI help, then reviewed and tested them myself. Treat this project as AI-assisted.
 
 ## What it adds
 
